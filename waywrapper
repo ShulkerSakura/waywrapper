@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # 全局配置
+VERSION=1.0-20250810
 CONFIG_DIR="/etc/waywrapper"
 CONFIG_FILE="$CONFIG_DIR/binaries.conf"
 
@@ -13,31 +14,32 @@ require_sudo_or_root() {
     fi
 }
 
+show_version() {
+    echo $VERSION
+}
+
 # 显示帮助
 show_help() {
     cat << 'EOF'
 waywrapper - Wayland wrapper manager for binaries
 
 Usage:
-  waywrapper --set-binary-path /path/to/binary
-  waywrapper --remove-binary-path /path/to/binary
-  waywrapper --update [--dry-run] [--force]
-  waywrapper --list
+  waywrapper --set-binary-path | -s /path/to/binary
+  waywrapper --remove-binary-path | -r /path/to/binary
+  waywrapper --update | -u [--dry-run] [--force]
+  waywrapper --list | -l
   waywrapper --help | -h
+  waywrapper --version | -v
 
 Options:
-  --set-binary-path PATH     Register a binary for Wayland wrapping
-  --remove-binary-path PATH  Unregister a binary
-  --update                   Apply wrapper scripts to registered binaries
+  --set-binary-path, -s      Register a binary for Wayland wrapping
+  --remove-binary-path, -r   Unregister a binary
+  --update, -u               Apply wrapper scripts to registered binaries
   --update --dry-run         Simulate update (no changes made)
   --update --force           Re-wrap even if already wrapped
-  --list                     List all registered binaries
+  --list, -l                 List all registered binaries
   --help, -h                 Show this help message
-
-Notes:
-  - Must run with sudo for --set-binary-path, --remove-binary-path, and --update.
-  - Original binary is saved as <binary>.orig.
-  - Wrapper adds: --ozone-platform-hint=wayland
+  --version, -v              Show version
 EOF
 }
 
@@ -124,7 +126,7 @@ if [[ ! -f "$ORIG_BINARY" ]]; then
 fi
 
 # Enable Wayland by default
-exec "$ORIG_BINARY" --ozone-platform-hint=wayland "$@"
+exec "$ORIG_BINARY" --ozone-platform-hint=wayland --enable-wayland-ime "$@"
 EOF
 
     # 恢复权限（参考 .orig）
@@ -171,7 +173,7 @@ update_binaries() {
         ((total++))
 
         if [[ ! -f "$binary_path" ]]; then
-            echo "⚠️  Binary not found: $binary_path"
+            echo "⚠  Binary not found: $binary_path"
             continue
         fi
 
@@ -180,7 +182,7 @@ update_binaries() {
         # 判断是否已经是 wrapper 脚本
         if is_wrapper_script "$binary_path"; then
             if [[ "$force" != true ]] && [[ "$dry_run" != true ]]; then
-                echo "⏭️  Skipping (already wrapped): $binary_path"
+                echo "⏭  Skipping (already wrapped): $binary_path"
                 ((skipped++))
                 continue
             fi
@@ -220,7 +222,7 @@ update_binaries() {
 
         # 检查 .orig 是否已存在（防止覆盖真实数据）
         if [[ -f "$orig_path" ]]; then
-            echo "⚠️  Backup already exists: $orig_path"
+            echo "⚠  Backup already exists: $orig_path"
             echo "    This may be left over from a failed setup."
             if [[ "$force" == true ]]; then
                 echo "    --force used: proceeding to rebuild wrapper."
@@ -263,7 +265,10 @@ main() {
     [[ $# -eq 0 ]] && show_help && exit 1
 
     case "$1" in
-        --set-binary-path)
+        --version|-v)
+            show_version
+            ;;
+        --set-binary-path|-s)
             require_sudo_or_root
             if [[ -z "$2" ]]; then
                 echo "Error: Missing path for --set-binary-path" >&2
@@ -272,7 +277,7 @@ main() {
             set_binary_path "$2"
             ;;
 
-        --remove-binary-path)
+        --remove-binary-path|-r)
             require_sudo_or_root
             if [[ -z "$2" ]]; then
                 echo "Error: Missing path for --remove-binary-path" >&2
@@ -281,7 +286,7 @@ main() {
             remove_binary_path "$2"
             ;;
 
-        --list)
+        --list|-l)
             if [[ -f "$CONFIG_FILE" ]]; then
                 list_binaries
             else
@@ -289,7 +294,7 @@ main() {
             fi
             ;;
 
-        --update)
+        --update|-u)
             require_sudo_or_root
             shift
             update_binaries "$@"
