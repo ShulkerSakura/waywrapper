@@ -33,7 +33,8 @@ Now Edge runs natively on Wayland.
 | `--update --force` | Rebuild existing wrappers |
 | `--list` | Show registered binaries |
 | `--remove-binary-path /path` | Remove from list |
-
+| `--help` | Show usage |
+| `--version` | Show version |
 > ⚠️ Run all write commands with `sudo`.
 
 ---
