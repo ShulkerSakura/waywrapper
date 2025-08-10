@@ -1,0 +1,311 @@
+#!/bin/bash
+
+# 全局配置
+CONFIG_DIR="/etc/waywrapper"
+CONFIG_FILE="$CONFIG_DIR/binaries.conf"
+
+# 检查是否以 root 运行（写系统文件需要权限）
+require_sudo_or_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This script requires root privileges to manage global binaries." >&2
+        echo "Please run with sudo." >&2
+        exit 1
+    fi
+}
+
+# 显示帮助
+show_help() {
+    cat << 'EOF'
+waywrapper - Wayland wrapper manager for binaries
+
+Usage:
+  waywrapper --set-binary-path /path/to/binary
+  waywrapper --remove-binary-path /path/to/binary
+  waywrapper --update [--dry-run] [--force]
+  waywrapper --list
+  waywrapper --help | -h
+
+Options:
+  --set-binary-path PATH     Register a binary for Wayland wrapping
+  --remove-binary-path PATH  Unregister a binary
+  --update                   Apply wrapper scripts to registered binaries
+  --update --dry-run         Simulate update (no changes made)
+  --update --force           Re-wrap even if already wrapped
+  --list                     List all registered binaries
+  --help, -h                 Show this help message
+
+Notes:
+  - Must run with sudo for --set-binary-path, --remove-binary-path, and --update.
+  - Original binary is saved as <binary>.orig.
+  - Wrapper adds: --ozone-platform-hint=wayland
+EOF
+}
+
+# 检查是否是 wrapper 脚本
+is_wrapper_script() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    head -n 5 "$file" 2>/dev/null | grep -q "IsWrapper=true"
+}
+
+# 注册二进制
+set_binary_path() {
+    local path="$1"
+    if [[ ! -f "$path" ]]; then
+        echo "Error: Binary not found: $path" >&2
+        exit 1
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    touch "$CONFIG_FILE"
+
+    if grep -Fxq "$path" "$CONFIG_FILE" 2>/dev/null; then
+        echo "Already registered: $path"
+    else
+        echo "$path" >> "$CONFIG_FILE"
+        echo "Registered: $path"
+    fi
+}
+
+# 移除已注册的二进制
+remove_binary_path() {
+    local path="$1"
+    if grep -Fxq "$path" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i "\|$path|d" "$CONFIG_FILE"
+        echo "Removed from registry: $path"
+    else
+        echo "Not found in registry: $path"
+    fi
+}
+
+# 列出所有注册的二进制
+list_binaries() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "No binaries registered."
+        return 0
+    fi
+
+    echo "Registered binaries:"
+    grep -v '^$' "$CONFIG_FILE" | while IFS= read -r bin; do
+        if [[ -n "$bin" ]]; then
+            local status="not exists"
+            if [[ -f "$bin" ]]; then
+                if is_wrapper_script "$bin"; then
+                    status="wrapped"
+                else
+                    status="raw binary (not wrapped)"
+                fi
+            elif [[ -f "$bin.orig" ]]; then
+                status="original exists (.orig)"
+            fi
+            printf "  %s (%s)\n" "$bin" "$status"
+        fi
+    done
+}
+
+create_wrapper_script() {
+    local wrapper_path="$1"
+    local orig_path="$2"
+
+    cat > "$wrapper_path" << 'EOF'
+#!/bin/bash
+# waywrapper: Wrapper script to enable Wayland via Ozone
+IsWrapper=true
+
+# Resolve the absolute path of the original binary
+ORIG_BINARY="$(readlink -f "$0").orig"
+
+# Safety check: ensure .orig file exists
+if [[ ! -f "$ORIG_BINARY" ]]; then
+    echo "❌ waywrapper: Critical error - original binary missing:" >&2
+    echo "    $ORIG_BINARY" >&2
+    echo "💡 Run 'sudo waywrapper --update' to fix, or restore manually." >&2
+    exit 1
+fi
+
+# Enable Wayland by default
+exec "$ORIG_BINARY" --ozone-platform-hint=wayland "$@"
+EOF
+
+    # 恢复权限（参考 .orig）
+    if [[ -f "$orig_path" ]]; then
+        chmod --reference="$orig_path" "$wrapper_path" 2>/dev/null || chmod +x "$wrapper_path"
+    else
+        chmod +x "$wrapper_path"
+    fi
+}
+
+update_binaries() {
+    local dry_run=false
+    local force=false
+
+    # 解析选项
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            --force)
+                force=true
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "No binaries registered. Use --set-binary-path first."
+        return 0
+    fi
+
+    local total=0
+    local skipped=0
+    local processed=0
+    local repaired=0
+
+    while IFS= read -r binary_path; do
+        [[ -z "$binary_path" ]] && continue
+        ((total++))
+
+        if [[ ! -f "$binary_path" ]]; then
+            echo "⚠️  Binary not found: $binary_path"
+            continue
+        fi
+
+        local orig_path="$binary_path.orig"
+
+        # 判断是否已经是 wrapper 脚本
+        if is_wrapper_script "$binary_path"; then
+            if [[ "$force" != true ]] && [[ "$dry_run" != true ]]; then
+                echo "⏭️  Skipping (already wrapped): $binary_path"
+                ((skipped++))
+                continue
+            fi
+
+            # 强制更新或 dry-run 模式
+            if [[ "$dry_run" == true ]]; then
+                echo "📝 Would re-wrap (update wrapper): $binary_path"
+                ((processed++))
+                continue
+            fi
+
+            # 检查 .orig 是否存在
+            if [[ ! -f "$orig_path" ]]; then
+                echo "❌ Wrapper exists but original backup missing: $orig_path"
+                echo "💡 Cannot restore. Skipping: $binary_path"
+                continue
+            fi
+
+            # 删除旧 wrapper，直接重建
+            rm -f "$binary_path"
+            echo "🔧 Removed old wrapper: $binary_path"
+
+            # 创建新 wrapper
+            create_wrapper_script "$binary_path" "$orig_path"
+            echo "✨ Updated wrapper: $binary_path"
+            ((repaired++))
+            continue
+        fi
+
+        # 不是 wrapper 脚本：执行标准包装流程
+
+        if [[ "$dry_run" == true ]]; then
+            echo "📝 Would wrap (new): $binary_path"
+            ((processed++))
+            continue
+        fi
+
+        # 检查 .orig 是否已存在（防止覆盖真实数据）
+        if [[ -f "$orig_path" ]]; then
+            echo "⚠️  Backup already exists: $orig_path"
+            echo "    This may be left over from a failed setup."
+            if [[ "$force" == true ]]; then
+                echo "    --force used: proceeding to rebuild wrapper."
+                rm -f "$binary_path"  # 只删 wrapper，不碰 .orig
+                create_wrapper_script "$binary_path" "$orig_path"
+                echo "✨ Rebuilt wrapper (missing): $binary_path"
+                ((repaired++))
+            else
+                echo "    Skipping. Use --force to rebuild wrapper."
+                ((skipped++))
+            fi
+            continue
+        fi
+
+        # 标准流程：重命名 + 创建 wrapper
+        if mv "$binary_path" "$orig_path"; then
+            echo "📦 Renamed to backup: $binary_path -> $orig_path"
+        else
+            echo "❌ Failed to rename: $binary_path" >&2
+            continue
+        fi
+
+        create_wrapper_script "$binary_path" "$orig_path"
+        echo "✨ Created wrapper: $binary_path"
+        ((processed++))
+    done < "$CONFIG_FILE"
+
+    # 汇总
+    echo "---"
+    echo "Summary: $total total"
+    echo "         $processed new wrapped, $repaired updated, $skipped skipped"
+    if [[ "$dry_run" == true ]]; then
+        echo "(Dry run mode: no changes were made)"
+    fi
+}
+
+# 主函数
+main() {
+    # 至少一个参数
+    [[ $# -eq 0 ]] && show_help && exit 1
+
+    case "$1" in
+        --set-binary-path)
+            require_sudo_or_root
+            if [[ -z "$2" ]]; then
+                echo "Error: Missing path for --set-binary-path" >&2
+                exit 1
+            fi
+            set_binary_path "$2"
+            ;;
+
+        --remove-binary-path)
+            require_sudo_or_root
+            if [[ -z "$2" ]]; then
+                echo "Error: Missing path for --remove-binary-path" >&2
+                exit 1
+            fi
+            remove_binary_path "$2"
+            ;;
+
+        --list)
+            if [[ -f "$CONFIG_FILE" ]]; then
+                list_binaries
+            else
+                echo "No binaries registered."
+            fi
+            ;;
+
+        --update)
+            require_sudo_or_root
+            shift
+            update_binaries "$@"
+            ;;
+
+        --help|-h)
+            show_help
+            ;;
+
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use --help for usage." >&2
+            exit 1
+            ;;
+    esac
+}
+
+# 执行
+main "$@"
