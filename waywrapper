@@ -105,9 +105,18 @@ list_binaries() {
     done
 }
 
+is_vscode_binary() {
+    local path="$1"
+    # 可扩展为数组支持多个路径
+    [[ "$path" == "/usr/share/code/code" ]] || \
+    [[ "$path" == "/usr/bin/code" ]] || \
+    [[ "$path" == "/opt/visual-studio-code/code" ]]
+}
+
 create_wrapper_script() {
     local wrapper_path="$1"
     local orig_path="$2"
+    local pass_args="${3:-true}"  # 新增：是否传递 "$@"
 
     cat > "$wrapper_path" << 'EOF'
 #!/bin/bash
@@ -126,10 +135,20 @@ if [[ ! -f "$ORIG_BINARY" ]]; then
 fi
 
 # Enable Wayland by default
-exec "$ORIG_BINARY" --ozone-platform-hint=wayland --enable-wayland-ime "$@"
 EOF
 
-    # 恢复权限（参考 .orig）
+    # 动态添加执行命令（是否带 "$@"）
+    if [[ "$pass_args" == "true" ]]; then
+        cat >> "$wrapper_path" << 'EOF'
+exec "$ORIG_BINARY" --ozone-platform-hint=wayland --enable-wayland-ime "$@"
+EOF
+    else
+        cat >> "$wrapper_path" << 'EOF'
+exec "$ORIG_BINARY" --ozone-platform-hint=wayland --enable-wayland-ime
+EOF
+    fi
+
+    # 恢复权限
     if [[ -f "$orig_path" ]]; then
         chmod --reference="$orig_path" "$wrapper_path" 2>/dev/null || chmod +x "$wrapper_path"
     else
@@ -173,7 +192,7 @@ update_binaries() {
         ((total++))
 
         if [[ ! -f "$binary_path" ]]; then
-            echo "⚠  Binary not found: $binary_path"
+            echo "⚠️  Binary not found: $binary_path"
             continue
         fi
 
@@ -182,75 +201,99 @@ update_binaries() {
         # 判断是否已经是 wrapper 脚本
         if is_wrapper_script "$binary_path"; then
             if [[ "$force" != true ]] && [[ "$dry_run" != true ]]; then
-                echo "⏭  Skipping (already wrapped): $binary_path"
+                echo "⏭️  Skipping (already wrapped): $binary_path"
                 ((skipped++))
                 continue
             fi
 
-            # 强制更新或 dry-run 模式
             if [[ "$dry_run" == true ]]; then
                 echo "📝 Would re-wrap (update wrapper): $binary_path"
                 ((processed++))
                 continue
             fi
 
-            # 检查 .orig 是否存在
+            # 强制更新：检查 .orig 是否存在
             if [[ ! -f "$orig_path" ]]; then
                 echo "❌ Wrapper exists but original backup missing: $orig_path"
                 echo "💡 Cannot restore. Skipping: $binary_path"
                 continue
             fi
 
-            # 删除旧 wrapper，直接重建
             rm -f "$binary_path"
             echo "🔧 Removed old wrapper: $binary_path"
 
-            # 创建新 wrapper
-            create_wrapper_script "$binary_path" "$orig_path"
+            # 判断是否为 VSCode 模式（不传递 "$@"）
+            local pass_args="true"
+            if is_vscode_binary "$binary_path"; then
+                pass_args="false"
+                echo "🔧 VSCode mode: wrapper will NOT pass \$@"
+            fi
+
+            create_wrapper_script "$binary_path" "$orig_path" "$pass_args"
             echo "✨ Updated wrapper: $binary_path"
             ((repaired++))
             continue
         fi
 
-        # 不是 wrapper 脚本：执行标准包装流程
+        # ==================================================================
+        # ✅ 情况：当前 binary 不是 wrapper 脚本（可能是新安装或包管理器更新后）
+        # ==================================================================
 
         if [[ "$dry_run" == true ]]; then
-            echo "📝 Would wrap (new): $binary_path"
+            local mode="new"
+            if is_vscode_binary "$binary_path"; then
+                mode="new (VSCode mode, no \$@)"
+            fi
+            echo "📝 Would wrap ($mode): $binary_path"
             ((processed++))
             continue
         fi
 
-        # 检查 .orig 是否已存在（防止覆盖真实数据）
+        # 检查是否为可执行文件（防止误操作脚本或链接）
+        if ! file "$binary_path" | grep -qE "executable|ELF"; then
+            echo "⚠️  Not a binary executable: $binary_path"
+            echo "    Skipping. If this is intentional, use a wrapper manually."
+            ((skipped++))
+            continue
+        fi
+
+        # 如果 .orig 存在，说明之前包装过，但现在 binary 被替换了（如 apt upgrade）
         if [[ -f "$orig_path" ]]; then
-            echo "⚠  Backup already exists: $orig_path"
-            echo "    This may be left over from a failed setup."
-            if [[ "$force" == true ]]; then
-                echo "    --force used: proceeding to rebuild wrapper."
-                rm -f "$binary_path"  # 只删 wrapper，不碰 .orig
-                create_wrapper_script "$binary_path" "$orig_path"
-                echo "✨ Rebuilt wrapper (missing): $binary_path"
-                ((repaired++))
+            echo "🔄 Detected package update: original wrapper lost, new binary in place."
+            echo "    Backing up CURRENT $binary_path to $orig_path (overwriting old .orig)"
+
+            # 将当前新二进制覆盖到 .orig（保留最新版本）
+            if mv -f "$binary_path" "$orig_path"; then
+                echo "📦 Updated backup: $orig_path"
             else
-                echo "    Skipping. Use --force to rebuild wrapper."
-                ((skipped++))
+                echo "❌ Failed to update .orig backup: $binary_path → $orig_path" >&2
+                continue
             fi
-            continue
-        fi
-
-        # 标准流程：重命名 + 创建 wrapper
-        if mv "$binary_path" "$orig_path"; then
-            echo "📦 Renamed to backup: $binary_path -> $orig_path"
         else
-            echo "❌ Failed to rename: $binary_path" >&2
-            continue
+            # 正常首次包装：重命名原 binary 为 .orig
+            if mv "$binary_path" "$orig_path"; then
+                echo "📦 First-time wrap: $binary_path -> $orig_path"
+            else
+                echo "❌ Failed to rename $binary_path to $orig_path" >&2
+                continue
+            fi
         fi
 
-        create_wrapper_script "$binary_path" "$orig_path"
+        # 决定是否传递 "$@"
+        local pass_args="true"
+        if is_vscode_binary "$binary_path"; then
+            pass_args="false"
+            echo "🔧 Applying VSCode mode: wrapper will NOT pass \$@"
+        fi
+
+        # 创建新的 wrapper 脚本
+        create_wrapper_script "$binary_path" "$orig_path" "$pass_args"
         echo "✨ Created wrapper: $binary_path"
         ((processed++))
+
     done < "$CONFIG_FILE"
 
-    # 汇总
+    # 输出统计
     echo "---"
     echo "Summary: $total total"
     echo "         $processed new wrapped, $repaired updated, $skipped skipped"
