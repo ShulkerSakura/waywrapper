@@ -38,7 +38,3 @@ Now Edge runs natively on Wayland.
 > ⚠️ Run all write commands with `sudo`.
 
 ---
-
-## ⚠️ Important: VS Code Warning
-
-Do Not Patch VS Code, it doesn't need to patch and patch will causes bad option error.  
